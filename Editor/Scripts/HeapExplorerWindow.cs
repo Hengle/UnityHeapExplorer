@@ -97,39 +97,6 @@ namespace HeapExplorer
             }
         }
 
-        int m_ExcludeNativeFromConnections = -1;
-        bool excludeNativeFromConnections
-        {
-            get
-            {
-                if (m_ExcludeNativeFromConnections == -1)
-                {
-                    var value = EditorPrefs.GetBool("HeapExplorerWindow.excludeNativeFromConnections", false);
-                    m_ExcludeNativeFromConnections = value ? 1 : 0;
-                }
-
-                return m_ExcludeNativeFromConnections > 0;
-            }
-            set
-            {
-                m_ExcludeNativeFromConnections = value ? 1 : 0;
-                EditorPrefs.SetBool("HeapExplorerWindow.excludeNativeFromConnections", value);
-            }
-        }
-
-        bool ignoreNestedStructs
-        {
-            get
-            {
-                return EditorPrefs.GetBool("HeapExplorerWindow.ignoreNestedStructs", true);
-            }
-            set
-            {
-                PackedManagedObjectCrawler.s_IgnoreNestedStructs = value;
-                EditorPrefs.SetBool("HeapExplorerWindow.ignoreNestedStructs", value);
-            }
-        }
-
         bool showInternalMemorySections
         {
             get
@@ -164,11 +131,7 @@ namespace HeapExplorer
             s_ViewTypes.Add(type);
         }
 
-#if UNITY_2018_3_OR_NEWER
         [MenuItem("Window/Analysis/Heap Explorer", priority = 5)]
-#else
-        [MenuItem("Window/Heap Explorer")]
-#endif
         static void Create()
         {
             if (!HeEditorUtility.IsVersionOrNewer(2019, 3))
@@ -186,8 +149,6 @@ namespace HeapExplorer
             titleContent = new GUIContent(HeGlobals.k_Title);
             minSize = new Vector2(800, 600);
             snapshotPath = "";
-            excludeNativeFromConnections = excludeNativeFromConnections;
-            ignoreNestedStructs = ignoreNestedStructs;
             showInternalMemorySections = showInternalMemorySections;
 
             m_ThreadJobs = new List<AbstractThreadJob>();
@@ -204,7 +165,6 @@ namespace HeapExplorer
             TryAbortThread();
             m_ThreadJobs = new List<AbstractThreadJob>();
 
-            UnityEditor.MemoryProfiler.MemorySnapshot.OnSnapshotReceived -= OnHeapReceived;
             EditorApplication.update -= OnApplicationUpdate;
 
             DestroyViews();
@@ -438,7 +398,8 @@ namespace HeapExplorer
 
         void FreeMem()
         {
-            System.GC.Collect();
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
         }
 
         void ActivateView(object userData)
@@ -565,14 +526,6 @@ namespace HeapExplorer
                     menu.AddItem(new GUIContent("Settings/Debug View Menu"), debugViewMenu, delegate ()
                     {
                         debugViewMenu = !debugViewMenu;
-                    });
-                    menu.AddItem(new GUIContent("Settings/Exclude NativeObject connections when capturing a snapshot (experimental)"), excludeNativeFromConnections, delegate ()
-                    {
-                        excludeNativeFromConnections = !excludeNativeFromConnections;
-                    });
-                    menu.AddItem(new GUIContent("Settings/Ignore nested structs (workaround for bug Case 1104590)"), ignoreNestedStructs, delegate ()
-                    {
-                        ignoreNestedStructs = !ignoreNestedStructs;
                     });
                     menu.AddItem(new GUIContent("Settings/Show unaligned memory sections (removes MonoMemPool sections)"), showInternalMemorySections, delegate ()
                     {
@@ -850,7 +803,7 @@ namespace HeapExplorer
         void CaptureAndSaveHeap()
         {
             if (string.IsNullOrEmpty(autoSavePath))
-                autoSavePath = Application.dataPath + "/memory.heap";
+                autoSavePath = System.IO.Path.Combine(Application.persistentDataPath, "memory.heap");
 
             var path = EditorUtility.SaveFilePanel("Save snapshot as...", System.IO.Path.GetDirectoryName(autoSavePath), System.IO.Path.GetFileNameWithoutExtension(autoSavePath), "heap");
             if (string.IsNullOrEmpty(path))
@@ -863,8 +816,8 @@ namespace HeapExplorer
                 FreeMem();
                 m_IsCapturing = true;
 
-                UnityEditor.MemoryProfiler.MemorySnapshot.OnSnapshotReceived += OnHeapReceivedSaveOnly;
-                UnityEditor.MemoryProfiler.MemorySnapshot.RequestNewSnapshot();
+                string snapshotPath = System.IO.Path.ChangeExtension(path, "snapshot");
+                UnityEngine.Profiling.Memory.Experimental.MemoryProfiler.TakeSnapshot(snapshotPath, OnHeapReceivedSaveOnly);
             }
             finally
             {
@@ -873,16 +826,13 @@ namespace HeapExplorer
             }
         }
 
-        void OnHeapReceivedSaveOnly(UnityEditor.MemoryProfiler.PackedMemorySnapshot snapshot)
+        void OnHeapReceivedSaveOnly(string path, bool captureResult)
         {
-            UnityEditor.MemoryProfiler.MemorySnapshot.OnSnapshotReceived -= OnHeapReceivedSaveOnly;
-
             EditorUtility.DisplayProgressBar(HeGlobals.k_Title, "Saving memory...", 0.5f);
             try
             {
                 var args = new MemorySnapshotProcessingArgs();
-                args.source = snapshot;
-                args.excludeNativeFromConnections = excludeNativeFromConnections;
+                args.source = UnityEditor.Profiling.Memory.Experimental.PackedMemorySnapshot.Load(path);
 
                 var heap = PackedMemorySnapshot.FromMemoryProfiler(args);
                 heap.SaveToFile(autoSavePath);
@@ -912,8 +862,8 @@ namespace HeapExplorer
                 Reset();
                 m_IsCapturing = true;
 
-                UnityEditor.MemoryProfiler.MemorySnapshot.OnSnapshotReceived += OnHeapReceived;
-                UnityEditor.MemoryProfiler.MemorySnapshot.RequestNewSnapshot();
+                var path = FileUtil.GetUniqueTempPathInProject();
+                UnityEngine.Profiling.Memory.Experimental.MemoryProfiler.TakeSnapshot(path, OnHeapReceived);
             }
             finally
             {
@@ -922,10 +872,8 @@ namespace HeapExplorer
             }
         }
 
-        void OnHeapReceived(UnityEditor.MemoryProfiler.PackedMemorySnapshot snapshot)
+        void OnHeapReceived(string path, bool captureResult)
         {
-            UnityEditor.MemoryProfiler.MemorySnapshot.OnSnapshotReceived -= OnHeapReceived;
-
             EditorUtility.DisplayProgressBar(HeGlobals.k_Title, "Reading memory...", 0.5f);
             try
             {
@@ -936,14 +884,15 @@ namespace HeapExplorer
                     var job = new ReceiveThreadJob
                     {
                         threadFunc = ReceiveHeapThreaded,
-                        snapshot = snapshot
-                    };
+                        snapshot = UnityEditor.Profiling.Memory.Experimental.PackedMemorySnapshot.Load(path)
+                };
                     ScheduleJob(job);
                 }
                 else
                 {
                     EditorUtility.DisplayProgressBar(HeGlobals.k_Title, "Analyzing memory...", 0.75f);
-                    ReceiveHeapThreaded(snapshot);
+                    var sshot = UnityEditor.Profiling.Memory.Experimental.PackedMemorySnapshot.Load(path);
+                    ReceiveHeapThreaded(sshot);
                 }
             }
             finally
@@ -958,8 +907,7 @@ namespace HeapExplorer
         void ReceiveHeapThreaded(object userData)
         {
             var args = new MemorySnapshotProcessingArgs();
-            args.source = userData as UnityEditor.MemoryProfiler.PackedMemorySnapshot;
-            args.excludeNativeFromConnections = excludeNativeFromConnections;
+            args.source = userData as UnityEditor.Profiling.Memory.Experimental.PackedMemorySnapshot;
 
             try
             {
@@ -1010,7 +958,7 @@ namespace HeapExplorer
 
     class ReceiveThreadJob : AbstractThreadJob
     {
-        public UnityEditor.MemoryProfiler.PackedMemorySnapshot snapshot;
+        public UnityEditor.Profiling.Memory.Experimental.PackedMemorySnapshot snapshot;
         public Action<object> threadFunc;
 
         public override void ThreadFunc()
